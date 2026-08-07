@@ -24,8 +24,12 @@ def get_contours(mask,
 
 def normalize_contours(contours: list[np.ndarray], width, height) -> list[np.ndarray]:
     for i, contour in enumerate(contours):
-        contour[..., 0] = contour[..., 0] / width
-        contour[..., 1] = contour[..., 1] / height
+        # ``cv2.findContours`` normally returns integer arrays.  Cast before
+        # normalising; assigning fractional coordinates back into an integer
+        # array silently truncates every value between 0 and 1 to zero.
+        contour = np.asarray(contour, dtype=np.float32)
+        contour[..., 0] = contour[..., 0] / float(width)
+        contour[..., 1] = contour[..., 1] / float(height)
         contours[i] = contour
     return contours
 
