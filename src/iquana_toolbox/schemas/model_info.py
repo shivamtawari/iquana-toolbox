@@ -1,7 +1,8 @@
 import ast
+import json
 from typing import List, Optional, Literal, Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from iquana_toolbox.schemas.training import HyperParameter
 
@@ -49,33 +50,55 @@ def _parse_list_like(value: Any) -> list:
             return []
         if stripped.startswith("[") and stripped.endswith("]"):
             try:
-                parsed = ast.literal_eval(stripped)
+                parsed = json.loads(stripped)
                 if isinstance(parsed, list):
                     return parsed
-            except (ValueError, SyntaxError):
-                pass
+            except (ValueError, TypeError):
+                try:
+                    parsed = ast.literal_eval(stripped)
+                    if isinstance(parsed, list):
+                        return parsed
+                except (ValueError, SyntaxError):
+                    pass
         if "," in stripped:
             return [item.strip() for item in stripped.split(",") if item.strip()]
         return [stripped]
     return [value]
 
 
-def _parse_dict_like(value: Any) -> dict[str, str]:
+def _parse_mapping_like(value: Any) -> dict:
     if value is None:
         return {}
     if isinstance(value, dict):
-        return {str(key): str(val) for key, val in value.items()}
+        return value
     if isinstance(value, str):
         stripped = value.strip()
         if not stripped:
             return {}
         try:
-            parsed = ast.literal_eval(stripped)
+            parsed = json.loads(stripped)
             if isinstance(parsed, dict):
-                return {str(key): str(val) for key, val in parsed.items()}
-        except (ValueError, SyntaxError):
-            return {}
+                return parsed
+        except (ValueError, TypeError):
+            try:
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (ValueError, SyntaxError):
+                pass
     return {}
+
+
+def _parse_dict_like(value: Any) -> dict[str, str]:
+    return {str(key): str(val) for key, val in _parse_mapping_like(value).items()}
+
+
+def _parse_optional_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() == "null":
+        return None
+    return str(value)
 
 
 def _canonical_task(task_value: Any) -> Optional[str]:
@@ -85,9 +108,13 @@ def _canonical_task(task_value: Any) -> Optional[str]:
     alias_map = {
         "prompted_segmentation": "prompted_segmentation",
         "interactive_segmentation": "prompted_segmentation",
+        "prompted": "prompted_segmentation",
         "instance_segmentation": "instance_segmentation",
+        "instance": "instance_segmentation",
         "instance_suggestion": "instance_suggestion",
+        "instance_suggestions": "instance_suggestion",
         "semantic_segmentation": "semantic_segmentation",
+        "semantic": "semantic_segmentation",
     }
     return alias_map.get(normalized)
 
@@ -143,6 +170,8 @@ class ModelInfo(BaseModel):
         description: str: Human-readable short description of the model. This describes the model in markdown briefly.
 
     """
+    model_config = ConfigDict(validate_assignment=True)
+
     registry_key: str = Field(
         ...,
         examples=["unet", "sam2.1_tiny"],
@@ -239,6 +268,38 @@ class InstanceSegmentationModelInfo(ModelInfo):
         description="The label ids (classes) this model predicts. Empty for an untrained base model; "
                     "populated after (multiclass) training with the dataset's labels."
     )
+    segmentation_mode: Literal["flat", "hierarchical"] = Field(
+        default="flat",
+        description="Whether inference returns flat instances or reconstructs a hierarchy.",
+    )
+    target_encoding: Literal["standard", "exclusive_hierarchy_v1"] = Field(
+        default="standard",
+        description="The training target encoding used by the model.",
+    )
+
+    @model_validator(mode="after")
+    def _mirror_representation_tags(self):
+        """Keep string discovery tags synchronized with typed representation fields."""
+        object.__setattr__(self, "tags", {
+            **self.tags,
+            "segmentation_mode": self.segmentation_mode,
+            "target_encoding": self.target_encoding,
+        })
+        return self
+
+    def discovery_tags(self) -> dict[str, str]:
+        """Return current MLflow discovery tags, including typed fields.
+
+        Assignment validation keeps ``tags`` synchronized for normal model use.
+        Recomputing these two values at the registry boundary also protects the
+        registration path from stale mappings created by older callers or by
+        low-level Pydantic construction.
+        """
+        return {
+            **self.tags,
+            "segmentation_mode": self.segmentation_mode,
+            "target_encoding": self.target_encoding,
+        }
 
 
 class SemanticSegmentationModelInfo(ModelInfo):
@@ -276,6 +337,10 @@ def parse_tags_to_model_info(tags: dict[str, Any]) -> ModelInfo:
     if "tags" in payload:
         payload["tags"] = _parse_dict_like(payload.get("tags"))
 
+    for field_name in ("info_url", "usage_tip", "architecture", "license"):
+        if field_name in payload:
+            payload[field_name] = _parse_optional_string(payload[field_name])
+
     if "input_resolution" in payload:
         payload["input_resolution"] = [
             parsed for parsed in (_parse_optional_int(v) for v in _parse_list_like(payload.get("input_resolution")))
@@ -284,11 +349,50 @@ def parse_tags_to_model_info(tags: dict[str, Any]) -> ModelInfo:
 
     if "performance" in payload and isinstance(payload.get("performance"), str):
         # Fallback path: performance may arrive as a stringified dict in tags.
-        payload["performance"] = _parse_dict_like(payload.get("performance")) or None
+        payload["performance"] = _parse_mapping_like(payload.get("performance")) or None
 
-    task = _canonical_task(payload.get("task"))
-    if task is None:
-        task = _canonical_task(payload.get("model_task"))
+    if "training_parameters" in payload and isinstance(payload.get("training_parameters"), str):
+        parsed_training_parameters = _parse_list_like(payload.get("training_parameters"))
+        payload["training_parameters"] = parsed_training_parameters
+
+    discriminator_values = {}
+    for discriminator in ("task", "model_task"):
+        raw_value = payload.get(discriminator)
+        # A null discriminator is treated like an absent legacy tag. This keeps
+        # old metadata produced with an optional task field inferable.
+        if discriminator in payload and raw_value is not None:
+            canonical_value = _canonical_task(raw_value)
+            if canonical_value is None:
+                raise ValueError(
+                    f"Unknown {discriminator} value {raw_value!r}; expected a supported model task."
+                )
+            discriminator_values[discriminator] = canonical_value
+
+    if len(discriminator_values) == 2:
+        task, model_task = discriminator_values["task"], discriminator_values["model_task"]
+        if task != model_task:
+            raise ValueError(
+                f"Conflicting task discriminators: task={payload['task']!r}, "
+                f"model_task={payload['model_task']!r}."
+            )
+    else:
+        task = next(iter(discriminator_values.values()), None)
+
+    representation_fields = {"segmentation_mode", "target_encoding"}
+    declared_representation_fields = representation_fields.intersection(payload)
+    raw_task = payload.get("task") if payload.get("task") is not None else payload.get("model_task")
+    if declared_representation_fields and task is not None and task != "instance_segmentation":
+        raise ValueError(
+            "segmentation_mode and target_encoding may only be declared for "
+            f"instance_segmentation metadata; received task={raw_task!r}."
+        )
+
+    declares_instance_segmentation = (
+        task == "instance_segmentation"
+        or "label_ids" in payload
+        or "segmentation_mode" in payload
+        or "target_encoding" in payload
+    )
 
     model_cls: type[ModelInfo] = ModelInfo
     if task == "prompted_segmentation":
@@ -299,14 +403,17 @@ def parse_tags_to_model_info(tags: dict[str, Any]) -> ModelInfo:
         model_cls = InstanceSuggestionModelInfo
     elif task == "semantic_segmentation":
         model_cls = SemanticSegmentationModelInfo
+    elif declares_instance_segmentation:
+        model_cls = InstanceSegmentationModelInfo
     elif "prompt_types_supported" in payload or "refinement_supported" in payload:
         model_cls = PromptedSegmentationModelInfo
-    elif "label_ids" in payload:
-        model_cls = InstanceSegmentationModelInfo
 
     try:
         return model_cls.model_validate(payload)
     except ValidationError:
-        if model_cls is ModelInfo:
+        # An explicitly declared instance-segmentation payload must not be
+        # downgraded to generic ModelInfo: doing so would hide invalid encoding
+        # values and could make a consumer take an unsafe default path.
+        if model_cls in (ModelInfo, InstanceSegmentationModelInfo):
             raise
         return ModelInfo.model_validate(payload)

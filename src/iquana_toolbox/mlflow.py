@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 import shutil
 import sys
@@ -13,7 +14,14 @@ from mlflow import MlflowClient
 from mlflow.pyfunc import PyFuncModel
 
 from iquana_toolbox.ai.base_classes import BaseModel
-from iquana_toolbox.schemas.model_info import parse_tags_to_model_info, ModelInfo
+from iquana_toolbox.schemas.model_info import (
+    InstanceSegmentationModelInfo,
+    InstanceSuggestionModelInfo,
+    ModelInfo,
+    PromptedSegmentationModelInfo,
+    SemanticSegmentationModelInfo,
+    parse_tags_to_model_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,16 +98,18 @@ class MLFlowModelRegistry:
             self,
             model: BaseModel,
     ):
-        """ 
-            Register a new model in the registry with the given identifier. Tags can be provided in a dictionary. Tags 
+        """
+            Register a new model in the registry with the given identifier. Tags can be provided in a dictionary. Tags
             should include the task, e.g. 'prompted_segmentation' or 'instance_segmentation'.
             :param model: model to be registered
         """
 
         mlflow.set_tracking_uri(self.tracking_uri)
+        model_info = model.model_info
+        registry_tags = self._model_info_tags(model_info)
 
-        if ((not self.check_registered(model.model_info.registry_key))
-                or "user_id" in model.model_info.tags or "dataset_id" in model.model_info.tags):
+        if ((not self.check_registered(model_info.registry_key)
+                or "user_id" in registry_tags or "dataset_id" in registry_tags)):
             # If the model is not registered or this is a trained model (user_id or dataset_id is present), we log a new
             # version of the model.
             # Models may declare heavy/un-pickleable weights via ``get_artifacts``; we save
@@ -114,9 +124,9 @@ class MLFlowModelRegistry:
                 with mlflow.start_run():
                     mlflow.pyfunc.log_model(
                         python_model=model,
-                        registered_model_name=model.model_info.registry_key,
-                        tags=model.model_info.tags,
-                        metadata=model.model_info.model_dump(),
+                        registered_model_name=model_info.registry_key,
+                        tags=registry_tags,
+                        metadata=model_info.model_dump(),
                         artifacts=artifacts,
                         code_paths=code_paths,
                     )
@@ -126,23 +136,79 @@ class MLFlowModelRegistry:
             # to the registered model. Our read path (get_model_info /
             # get_model_infos_via_tags) queries the *registered model's* tags, so copy
             # them across explicitly here.
-            for key, value in model.model_info.tags.items():
-                self.client.set_registered_model_tag(
-                    model.model_info.registry_key, key, str(value)
-                )
-            # ``log_model`` only stores the description inside the artifact metadata, but
-            # consumers read ``RegisteredModel.description`` directly. Mirror it across.
-            if model.model_info.description:
+            self._sync_registered_model_tags(model_info, registry_tags)
+            if model_info.description:
                 self.client.update_registered_model(
-                    model.model_info.registry_key,
-                    description=model.model_info.description,
+                    model_info.registry_key,
+                    description=model_info.description,
                 )
             logger.info(
-                f"Registered model {model.model_info.name} in MLflow with key {model.model_info.registry_key}.")
+                f"Registered model {model_info.name} in MLflow with key {model_info.registry_key}.")
         else:
-            logger.info(f"Model {model.model_info.name} is an already registered base model. Skipped.")
+            # A valid post-construction representation mutation must also reach
+            # an already registered model; otherwise discovery can remain stale.
+            self._sync_registered_model_tags(model_info, registry_tags)
+            logger.info(f"Model {model_info.name} is an already registered base model. Synchronized tags.")
 
-        self._invalidate_model_cache(model.model_info.registry_key)
+        self._invalidate_model_cache(model_info.registry_key)
+
+    @staticmethod
+    def _model_info_tags(model_info: ModelInfo) -> dict[str, str]:
+        """Serialize the complete typed model-info contract as discovery tags.
+
+        Registered-model tags are the source used by discovery, so every field
+        represented by ``parse_tags_to_model_info`` is persisted here. Typed
+        values are written after user tags so a stale or malicious discovery
+        tag cannot replace an authoritative field.
+        """
+        typed_values = model_info.model_dump(mode="json")
+        user_tags = dict(model_info.tags)
+        registry_tags = {
+            key: MLFlowModelRegistry._serialize_tag_value(value)
+            for key, value in user_tags.items()
+        }
+
+        # ``tags`` is itself a typed field. Persist it as one stable JSON value
+        # while also retaining its entries as first-class MLflow discovery tags.
+        typed_values["tags"] = user_tags
+        registry_tags.update({
+            key: MLFlowModelRegistry._serialize_tag_value(value)
+            for key, value in typed_values.items()
+        })
+
+        task_by_type = {
+            PromptedSegmentationModelInfo: "prompted_segmentation",
+            InstanceSegmentationModelInfo: "instance_segmentation",
+            InstanceSuggestionModelInfo: "instance_suggestion",
+            SemanticSegmentationModelInfo: "semantic_segmentation",
+        }
+        task = next(
+            (task_name for model_type, task_name in task_by_type.items() if isinstance(model_info, model_type)),
+            None,
+        )
+        if task is not None:
+            # Make the typed class the authority for both supported discriminator
+            # spellings, even if a user supplied stale values in ``tags``.
+            registry_tags["task"] = task
+            registry_tags["model_task"] = task
+        return registry_tags
+
+    @staticmethod
+    def _serialize_tag_value(value) -> str:
+        if isinstance(value, str):
+            return value
+        if value is None or isinstance(value, (bool, int, float, list, dict, tuple)):
+            return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return json.dumps(str(value), ensure_ascii=False)
+
+    def _sync_registered_model_tags(
+            self, model_info: ModelInfo, registry_tags: dict[str, str]
+    ) -> None:
+        """Copy current discovery tags to the MLflow registered-model entity."""
+        for key, value in registry_tags.items():
+            self.client.set_registered_model_tag(
+                model_info.registry_key, key, str(value)
+            )
 
     def check_registered(self, model_identifier: str):
         """ Check if a model is registered in the registry. """
