@@ -22,6 +22,15 @@ class InstanceSegmentationTrainingRequest(BaseTrainingRequest):
     )
     annotation_file_url: str = Field(..., title="Annotation File URL",
                                      description="The path to a COCO annotation file.")
+    selected_label_ids: list[int] = Field(
+        default_factory=list,
+        description="List of integer label IDs selected for training.",
+    )
+    enable_hierarchy: bool = Field(
+        default=True,
+        description="Whether exclusive hierarchy mode is enabled for training.",
+    )
+
 
 
 # ---------------------------------------------------------------------------

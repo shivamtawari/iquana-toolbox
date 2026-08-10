@@ -1,6 +1,7 @@
 import ast
 import json
-from typing import List, Optional, Literal, Any
+from typing import List, Optional, Literal, Any, Union
+
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -27,14 +28,15 @@ def _parse_optional_int(value: Any) -> Optional[int]:
     if isinstance(value, int):
         return value
     if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
+        stripped = value.strip().lower()
+        if not stripped or stripped in {"null", "none"}:
             return None
         try:
             return int(stripped)
         except ValueError:
             return None
     return None
+
 
 
 def _parse_list_like(value: Any) -> list:
@@ -242,6 +244,44 @@ class ModelInfo(BaseModel):
         description="Approximate performance characteristics (params, GFLOPs, latency) "
                     "for display and sorting in the model zoo."
     )
+    model_role: Literal["training_base", "trained"] = Field(
+        default="training_base",
+        description="Role of the model in the catalog. 'training_base' models are templates "
+                    "used for training; 'trained' models are inference-ready checkpoints."
+    )
+    base_model_registry_key: Optional[str] = Field(
+        default=None,
+        description="Registry key of the base model used for training (if applicable)."
+    )
+    base_model_version: Optional[str] = Field(
+        default=None,
+        description="Version of the base model used for training (if applicable)."
+    )
+    base_model_uri: Optional[str] = Field(
+        default=None,
+        description="MLflow URI of the base model used for training (if applicable)."
+    )
+    training_task_id: Optional[str] = Field(
+        default=None,
+        description="UUID of the training task that produced this model."
+    )
+    dataset_id: Optional[int] = Field(
+        default=None,
+        description="ID of the dataset this model was trained on."
+    )
+    trained_by: Optional[Union[str, int]] = Field(
+        default=None,
+        description="User ID or username of the person who initiated training."
+    )
+
+
+
+def generate_trained_model_registry_key(dataset_id: int, task_id: str, prefix: str = "mask2former") -> str:
+    """Generate a canonical, collision-resistant output model registry key for a training task."""
+    clean_prefix = prefix.strip().lower().replace("_", "-")
+    clean_task_id = str(task_id).strip().lower()
+    return f"{clean_prefix}-ds{dataset_id}-{clean_task_id}"
+
 
 
 class PromptedSegmentationModelInfo(ModelInfo):
@@ -337,9 +377,21 @@ def parse_tags_to_model_info(tags: dict[str, Any]) -> ModelInfo:
     if "tags" in payload:
         payload["tags"] = _parse_dict_like(payload.get("tags"))
 
-    for field_name in ("info_url", "usage_tip", "architecture", "license"):
+    for field_name in ("info_url", "usage_tip", "architecture", "license", "base_model_registry_key", "base_model_version", "base_model_uri", "training_task_id", "model_role"):
         if field_name in payload:
             payload[field_name] = _parse_optional_string(payload[field_name])
+
+    if "dataset_id" in payload:
+        payload["dataset_id"] = _parse_optional_int(payload["dataset_id"])
+
+    if "trained_by" in payload:
+        parsed_tb_int = _parse_optional_int(payload["trained_by"])
+        if parsed_tb_int is not None:
+            payload["trained_by"] = parsed_tb_int
+        else:
+            payload["trained_by"] = _parse_optional_string(payload["trained_by"])
+
+
 
     if "input_resolution" in payload:
         payload["input_resolution"] = [

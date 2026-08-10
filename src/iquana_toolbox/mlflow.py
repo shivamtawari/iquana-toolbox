@@ -56,6 +56,17 @@ def _infer_code_paths(model) -> Optional[list[str]]:
         return None
 
 
+from pydantic import BaseModel as PydanticBaseModel
+
+class ModelPublicationResult(PydanticBaseModel):
+    """Result of registering a model version in MLflow."""
+    registry_key: str
+    version: str
+    alias: Optional[str] = None
+    model_uri: str
+    run_id: Optional[str] = None
+
+
 class MLFlowModelRegistry:
     def __init__(self, tracking_uri, cache_maxsize: int = 8, cache_ttl_seconds: int = 3600):
         """Registry to hold and manage multiple models."""
@@ -63,6 +74,7 @@ class MLFlowModelRegistry:
         self.client = MlflowClient(tracking_uri=tracking_uri)
         self._model_cache = TTLCache(maxsize=cache_maxsize, ttl=cache_ttl_seconds)
         self._cache_lock = threading.Lock()
+
 
     def _invalidate_model_cache(self, model_identifier: str):
         """Clear all cached entries for a model across versions/aliases."""
@@ -94,35 +106,50 @@ class MLFlowModelRegistry:
             return Path(source).resolve().as_uri()
         return source
 
+    def set_registered_model_alias(self, name: str, alias: str, version: str) -> None:
+        """Assign an alias to a specific registered model version."""
+        mlflow.set_tracking_uri(self.tracking_uri)
+        self.client.set_registered_model_alias(name=name, alias=alias, version=str(version))
+        self._invalidate_model_cache(name)
+
+    def resolve_base_model_uri(self, registry_key: str, alias: str = "latest") -> tuple[str, str]:
+        """Resolve a base model key and alias to an exact version and MLflow URI.
+
+        Returns (exact_version, model_uri).
+        """
+
+        mlflow.set_tracking_uri(self.tracking_uri)
+        mv = self.client.get_model_version_by_alias(name=registry_key, alias=alias)
+        version = str(mv.version)
+        model_uri = f"models:/{registry_key}/{version}"
+        return version, model_uri
+
     def register_model(
             self,
             model: BaseModel,
-    ):
+            assign_alias: Optional[str] = "active",
+    ) -> Optional[ModelPublicationResult]:
         """
             Register a new model in the registry with the given identifier. Tags can be provided in a dictionary. Tags
             should include the task, e.g. 'prompted_segmentation' or 'instance_segmentation'.
             :param model: model to be registered
+            :param assign_alias: alias to assign to the registered version (defaults to 'active')
+            :return: ModelPublicationResult or None if non-logging base update
         """
 
         mlflow.set_tracking_uri(self.tracking_uri)
         model_info = model.model_info
         registry_tags = self._model_info_tags(model_info)
+        pub_result: Optional[ModelPublicationResult] = None
 
         if ((not self.check_registered(model_info.registry_key)
-                or "user_id" in registry_tags or "dataset_id" in registry_tags)):
-            # If the model is not registered or this is a trained model (user_id or dataset_id is present), we log a new
-            # version of the model.
-            # Models may declare heavy/un-pickleable weights via ``get_artifacts``; we save
-            # them to a temp dir and hand them to MLflow as artifacts (resolved back to local
-            # paths in ``load_context``) instead of cloudpickling the live objects.
+                or "user_id" in registry_tags or "dataset_id" in registry_tags or model_info.model_role == "trained")):
             artifacts_dir = tempfile.mkdtemp(prefix="iquana_model_artifacts_")
             try:
                 artifacts = model.get_artifacts(artifacts_dir)
-                # Bundle the model's source so it loads in workers that don't have the
-                # service root on sys.path (avoids "No module named 'models'" at load).
                 code_paths = _infer_code_paths(model)
-                with mlflow.start_run():
-                    mlflow.pyfunc.log_model(
+                with mlflow.start_run() as run:
+                    logged_model = mlflow.pyfunc.log_model(
                         python_model=model,
                         registered_model_name=model_info.registry_key,
                         tags=registry_tags,
@@ -130,27 +157,43 @@ class MLFlowModelRegistry:
                         artifacts=artifacts,
                         code_paths=code_paths,
                     )
+                    run_id = run.info.run_id
+                    reg_version = str(getattr(logged_model, "registered_model_version", "1"))
             finally:
                 shutil.rmtree(artifacts_dir, ignore_errors=True)
-            # MLflow 3.x attaches ``log_model(tags=...)`` to the LoggedModel entity, not
-            # to the registered model. Our read path (get_model_info /
-            # get_model_infos_via_tags) queries the *registered model's* tags, so copy
-            # them across explicitly here.
+
             self._sync_registered_model_tags(model_info, registry_tags)
             if model_info.description:
                 self.client.update_registered_model(
                     model_info.registry_key,
                     description=model_info.description,
                 )
+
+            if assign_alias:
+                self.set_registered_model_alias(
+                    name=model_info.registry_key,
+                    alias=assign_alias,
+                    version=reg_version,
+                )
+
+
+            model_uri = f"models:/{model_info.registry_key}/{reg_version}"
+            pub_result = ModelPublicationResult(
+                registry_key=model_info.registry_key,
+                version=reg_version,
+                alias=assign_alias,
+                model_uri=model_uri,
+                run_id=run_id,
+            )
             logger.info(
-                f"Registered model {model_info.name} in MLflow with key {model_info.registry_key}.")
+                f"Registered model {model_info.name} in MLflow with key {model_info.registry_key} v{reg_version}.")
         else:
-            # A valid post-construction representation mutation must also reach
-            # an already registered model; otherwise discovery can remain stale.
             self._sync_registered_model_tags(model_info, registry_tags)
             logger.info(f"Model {model_info.name} is an already registered base model. Synchronized tags.")
 
         self._invalidate_model_cache(model_info.registry_key)
+        return pub_result
+
 
     @staticmethod
     def _model_info_tags(model_info: ModelInfo) -> dict[str, str]:
@@ -177,21 +220,23 @@ class MLFlowModelRegistry:
         })
 
         task_by_type = {
-            PromptedSegmentationModelInfo: "prompted_segmentation",
-            InstanceSegmentationModelInfo: "instance_segmentation",
-            InstanceSuggestionModelInfo: "instance_suggestion",
-            SemanticSegmentationModelInfo: "semantic_segmentation",
+            PromptedSegmentationModelInfo: "prompted-segmentation",
+            InstanceSegmentationModelInfo: "instance-segmentation",
+            InstanceSuggestionModelInfo: "instance-suggestion",
+            SemanticSegmentationModelInfo: "semantic-segmentation",
         }
         task = next(
             (task_name for model_type, task_name in task_by_type.items() if isinstance(model_info, model_type)),
             None,
         )
         if task is not None:
-            # Make the typed class the authority for both supported discriminator
-            # spellings, even if a user supplied stale values in ``tags``.
-            registry_tags["task"] = task
-            registry_tags["model_task"] = task
+            canonical_task = task.replace("_", "-")
+            task_boolean_tag = "task_" + canonical_task.replace("-", "_")
+            registry_tags["task"] = canonical_task
+            registry_tags["model_task"] = canonical_task
+            registry_tags[task_boolean_tag] = "true"
         return registry_tags
+
 
     @staticmethod
     def _serialize_tag_value(value) -> str:
